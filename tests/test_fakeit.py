@@ -24,11 +24,11 @@ def multidimensional_parameters():
     num_params = (8, 8, 8)
 
     parameters = {
-        "tbabs_1_nh": rng.uniform(0.1, 0.4, size=num_params),
-        "powerlaw_1_alpha": rng.uniform(1, 3, size=num_params),
-        "powerlaw_1_norm": rng.exponential(10 ** (-0.5), size=num_params),
-        "blackbodyrad_1_kT": rng.uniform(0.1, 3.0, size=num_params),
-        "blackbodyrad_1_norm": rng.exponential(10 ** (-3), size=num_params),
+        "tbabs_1.nh": rng.uniform(0.1, 0.4, size=num_params),
+        "powerlaw_1.alpha": rng.uniform(1, 3, size=num_params),
+        "powerlaw_1.norm": rng.exponential(10 ** (-0.5), size=num_params),
+        "blackbodyrad_1.kT": rng.uniform(0.1, 3.0, size=num_params),
+        "blackbodyrad_1.norm": rng.exponential(10 ** (-3), size=num_params),
     }
 
     return parameters
@@ -43,11 +43,11 @@ def unidimensional_parameters():
     num_params = 16
 
     parameters = {
-        "tbabs_1_nh": rng.uniform(0.1, 0.4, size=num_params),
-        "powerlaw_1_alpha": rng.uniform(1, 3, size=num_params),
-        "powerlaw_1_norm": rng.exponential(10 ** (-0.5), size=num_params),
-        "blackbodyrad_1_kT": rng.uniform(0.1, 3.0, size=num_params),
-        "blackbodyrad_1_norm": rng.exponential(10 ** (-3), size=num_params),
+        "tbabs_1.nh": rng.uniform(0.1, 0.4, size=num_params),
+        "powerlaw_1.alpha": rng.uniform(1, 3, size=num_params),
+        "powerlaw_1.norm": rng.exponential(10 ** (-0.5), size=num_params),
+        "blackbodyrad_1.kT": rng.uniform(0.1, 3.0, size=num_params),
+        "blackbodyrad_1.norm": rng.exponential(10 ** (-3), size=num_params),
     }
 
     return parameters
@@ -93,15 +93,18 @@ def test_fakeits_parallel(obsconfs, model, sharded_parameters):
     chex.assert_type(spectra, int)
 
 
-def test_fakeits_sparsify(obsconfs, model, sharded_parameters):
+def test_fakeits_sparsify(obsconfs, model, unidimensional_parameters):
     obsconf = obsconfs[0]
     spectra = fakeit_for_multiple_parameters(
-        obsconf, model, sharded_parameters, apply_stat=False, sparsify_matrix=False
+        obsconf, model, unidimensional_parameters, apply_stat=False, sparsify_matrix=False
     )
     chex.assert_type(spectra, float)
 
+    # JAX explicit sharding currently does not infer an output sharding for the
+    # sparse scatter path used by BCOO matmul, so sparse coverage is kept on
+    # unsharded parameters while sharding coverage stays in test_fakeits_parallel.
     spectra = fakeit_for_multiple_parameters(
-        obsconf, model, sharded_parameters, apply_stat=False, sparsify_matrix=True
+        obsconf, model, unidimensional_parameters, apply_stat=False, sparsify_matrix=True
     )
     chex.assert_type(spectra, float)
 

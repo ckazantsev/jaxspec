@@ -47,6 +47,7 @@ def load_xspec_data(request, monkeypatch):
     return xspec_observation
 
 
+@pytest.mark.slow
 def test_obs_constitantcy(load_xspec_data, load_jaxspec_data):
     file_pha = table_manager.fetch("example_data/NGC7793_ULX4/PN_spectrum_grp20.fits")
     xspec_observation = load_xspec_data
@@ -60,6 +61,7 @@ def test_obs_constitantcy(load_xspec_data, load_jaxspec_data):
     ), f"The number of grouped channel is not the same as XSPEC {file_pha}"
 
 
+@pytest.mark.slow
 def test_bins(load_xspec_data, load_jaxspec_data):
     file_pha = table_manager.fetch("example_data/NGC7793_ULX4/PN_spectrum_grp20.fits")
     xspec_observation = load_xspec_data
@@ -82,6 +84,7 @@ def test_bins(load_xspec_data, load_jaxspec_data):
     ).all(), f"The unfolded channel energy bins are not the same as XSPEC {file_pha}"
 
 
+@pytest.mark.slow
 def test_flux_computation():
     xspec.AllData.clear()
     xspec.AllModels.clear()
@@ -97,18 +100,16 @@ def test_flux_computation():
     eflux_xspec = m.flux[0]  # erg/cm^2/s
 
     factor = (1 * u.keV).to(u.erg).value
+    pl_params = {
+        "powerlaw_1.norm": 1.0,
+        "powerlaw_1.alpha": 2.0,
+    }
     phflux_jaxspec = Powerlaw().photon_flux(
-        {"powerlaw_1_norm": 1.0, "powerlaw_1_alpha": 2.0}, e_low=0.5, e_high=1.5, n_points=10_000
+        e_low=0.5, e_high=1.5, params=pl_params, n_points=10_000
     )
 
     eflux_jaxspec = (
-        Powerlaw().energy_flux(
-            {"powerlaw_1_norm": 1.0, "powerlaw_1_alpha": 2.0},
-            e_low=0.5,
-            e_high=1.5,
-            n_points=10_000,
-        )
-        * factor
+        Powerlaw().energy_flux(e_low=0.5, e_high=1.5, params=pl_params, n_points=10_000) * factor
     )
 
     assert np.isclose(

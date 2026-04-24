@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal
 
 import arviz as az
 import astropy.cosmology.units as cu
@@ -18,7 +18,6 @@ from astropy.units import Unit
 from chainconsumer import Chain, ChainConsumer, PlotConfig
 from jax.experimental.sparse import BCOO
 from jax.typing import ArrayLike
-from numpyro.handlers import seed
 from scipy.special import gammaln
 
 from ._plot import (
@@ -31,20 +30,14 @@ from ._plot import (
     _error_bars_for_observed_data,
     _plot_binned_samples_with_error,
     _plot_poisson_data_with_error,
+    _rebin_xbins,
+    adaptive_bin_1d,
+    rebin_counts,
 )
 
 if TYPE_CHECKING:
     from ..fit import BayesianModel
     from ..model.background import BackgroundModel
-
-K = TypeVar("K")
-V = TypeVar("V")
-T = TypeVar("T")
-
-
-def auto_in_axes(pytree, axis=0):
-    """Return a pytree of 0/None depending on whether the leaf is batched."""
-    return jax.tree.map(lambda x: axis if (hasattr(x, "ndim") and x.ndim > 0) else None, pytree)
 
 
 class FitResult:
@@ -62,7 +55,7 @@ class FitResult:
         self.model = bayesian_fitter.spectral_model
         self.bayesian_fitter = bayesian_fitter
         self.inference_data = inference_data
-        self.obsconfs = bayesian_fitter._observation_container
+        self.obsconfs = bayesian_fitter.forward_model.observations
         self.background_model = background_model
 
         # Add the model used in fit to the metadata
@@ -82,15 +75,11 @@ class FitResult:
         return bool((rhat.to_array() < 1.01).all())
 
     def _ppc_folded_branches(self, obs_id):
+        # TODO : move this to the forward model class, it has nothing to do in here
         obs = self.obsconfs[obs_id]
 
-        # Slice the parameters corresponding to the current ObsID
-        if len(next(iter(self.input_parameters.values())).shape) > 2:
-            idx = list(self.obsconfs.keys()).index(obs_id)
-            obs_parameters = jax.tree.map(lambda x: x[..., idx], self.input_parameters)
-
-        else:
-            obs_parameters = self.input_parameters
+        idx = list(self.obsconfs.keys()).index(obs_id)
+        obs_parameters = jax.tree.map(lambda x: x[..., idx], self.spectrum_parameters)
 
         if self.bayesian_fitter.settings.get("sparse", False):
             transfer_matrix = BCOO.from_scipy_sparse(
@@ -103,7 +92,9 @@ class FitResult:
         energies = obs.in_energies
 
         flux_func = jax.jit(
-            jax.vmap(jax.vmap(lambda p: self.model.photon_flux(p, *energies, split_branches=True)))
+            jax.vmap(
+                jax.vmap(lambda p: self.model.photon_flux(*energies, params=p, split_branches=True))
+            )
         )
 
         convolve_func = jax.jit(
@@ -116,51 +107,70 @@ class FitResult:
     @cached_property
     def input_parameters(self) -> dict[str, ArrayLike]:
         """
-        The input parameters of the model.
+        The input parameters of the model, keyed by full dotted-path numpyro
+        site names (e.g. ``"spectrum.powerlaw_1.alpha"``,
+        ``"instrument.gain.factor"``, ``"background.countrate"``).
+
+        Shared parameters are broadcast along a trailing observation axis and
+        per-observation samples are stacked on that same axis when every
+        observation leaf has the same shape. Ragged per-observation entries are
+        kept as ``{observation_name: array}``.
         """
+        fm = self.bayesian_fitter.forward_model
+        obs_names = list(fm.observations.keys())
+        effective_prior = self.bayesian_fitter._effective_prior
 
-        posterior = az.extract(self.inference_data, combined=False)
-
-        samples_shape = (len(posterior.coords["chain"]), len(posterior.coords["draw"]))
-
-        total_shape = tuple(
-            posterior.sizes[d] for d in posterior.coords if not (("obs" in d) or ("bkg" in d))
+        out: dict[str, ArrayLike] = {}
+        # TODO : check wether this should be simplified under a single call ?
+        out.update(
+            fm.spectrum.extract_posterior_samples(self.inference_data, effective_prior, obs_names)
         )
-
-        posterior = {key: posterior[key].data for key in posterior.data_vars}
-
-        with seed(rng_seed=0):
-            input_parameters = self.bayesian_fitter.prior_distributions_func()
-
-        for key, value in input_parameters.items():
-            module, parameter = key.rsplit("_", 1)
-            key_to_search = f"mod/~/{module}_{parameter}"
-
-            if key_to_search in posterior.keys():
-                # We add as extra dimension as there might be different values per observation
-                if posterior[key_to_search].shape == samples_shape:
-                    to_set = posterior[key_to_search][..., None]
-                else:
-                    to_set = posterior[key_to_search]
-
-                input_parameters[f"{module}_{parameter}"] = to_set
-
-            else:
-                # The parameter is fixed in this case, so we just broadcast is over chain and draws
-                input_parameters[f"{module}_{parameter}"] = value[None, None, ...]
-
-            if len(total_shape) < len(input_parameters[f"{module}_{parameter}"].shape):
-                # If there are only chains and draws, we reduce
-                input_parameters[f"{module}_{parameter}"] = jnp.broadcast_to(
-                    input_parameters[f"{module}_{parameter}"][..., 0], total_shape
+        if fm.instrument_model is not None:
+            out.update(
+                fm.instrument_model.extract_posterior_samples(
+                    self.inference_data, effective_prior, obs_names
                 )
-
-            else:
-                input_parameters[f"{module}_{parameter}"] = jnp.broadcast_to(
-                    input_parameters[f"{module}_{parameter}"], total_shape
+            )
+        if fm.background_model is not None:
+            out.update(
+                fm.background_model.extract_posterior_samples(
+                    self.inference_data, effective_prior, obs_names
                 )
+            )
+        return out
 
-        return input_parameters
+    @cached_property
+    def spectrum_parameters(self) -> dict[str, ArrayLike]:
+        """Subset of :attr:`input_parameters` belonging to the spectral model."""
+        prefix = self.bayesian_fitter.forward_model.spectrum.prior_prefix
+        return {k: v for k, v in self.input_parameters.items() if k.startswith(prefix)}
+
+    def _register_derived_parameter(
+        self, name: str, value: ArrayLike, prefix: str | None = None
+    ) -> None:
+        posterior = self.inference_data.posterior
+        value = np.asarray(value)
+
+        # TODO : why do we need a prefix here ?
+        if prefix is None:
+            prefix = self.bayesian_fitter.forward_model.spectrum.prior_prefix
+
+        dims = ("chain", "draw")
+        if value.ndim > 2:
+            for var_name, data_array in posterior.data_vars.items():
+                if not var_name.startswith(prefix):
+                    continue
+                if data_array.shape == value.shape:
+                    dims = data_array.dims
+                    break
+                if data_array.ndim == value.ndim and data_array.shape[2:] == value.shape[2:]:
+                    dims = data_array.dims
+                    break
+            else:
+                extra_dims = tuple(f"derived_dim_{i}" for i in range(value.ndim - 2))
+                dims = ("chain", "draw", *extra_dims)
+
+        posterior[name] = (dims, value)
 
     def photon_flux(
         self,
@@ -182,36 +192,20 @@ class FitResult:
             register: Whether to register the flux with the other posterior parameters.
             n_points: The number of points per bin to use for computing the unfolded spectrum.
             n_grid: The number of grid points to use for computing the unfolded spectrum.
-
-        !!! warning
-            Computation of the folded flux is not implemented yet. Feel free to open an
-            [issue](https://github.com/renecotyfanboy/jaxspec/issues) in the GitHub repository.
         """
-
-        energy_grid = np.linspace(e_min, e_max, n_grid)
-
-        @jax.jit
-        @jnp.vectorize
-        def vectorized_flux(*pars):
-            parameters_pytree = jax.tree.unflatten(pytree_def, pars)
-            return self.model.photon_flux(
-                parameters_pytree, energy_grid[:-1], energy_grid[1:], n_points=n_points
-            )
-
-        flat_tree, pytree_def = jax.tree.flatten(self.input_parameters)
-        flux = vectorized_flux(*flat_tree).sum(axis=-1)  # Sum over all bins
-        conversion_factor = float((u.photon / u.cm**2 / u.s).to(unit))
-        value = np.asarray(flux * conversion_factor)
+        flux = self.model.integrated_flux(
+            e_min,
+            e_max,
+            params=self.spectrum_parameters,
+            energy=False,
+            n_points=n_points,
+            n_grid=n_grid,
+        )
+        value = np.asarray(flux * float((u.photon / u.cm**2 / u.s).to(unit)))
 
         if register:
-            # We handle the case where a parameter is split for multiple observables, hence giving multiple fluxes
-            # Unstable, will change in a future release with better handling for split parameters
-            extra_coords = tuple(
-                coord for coord in self.inference_data.posterior.coords if coord.startswith("mod")
-            )
-
-            self.inference_data.posterior[f"mod/~/photon_flux_{e_min:.1f}_{e_max:.1f}"] = (
-                ("chain", "draw", *extra_coords),
+            self._register_derived_parameter(
+                f"derived.photon_flux_{e_min:.1f}_{e_max:.1f}",
                 value,
             )
 
@@ -237,36 +231,20 @@ class FitResult:
             register: Whether to register the flux with the other posterior parameters.
             n_points: The number of points per bin to use for computing the unfolded spectrum.
             n_grid: The number of grid points to use for computing the unfolded spectrum.
-
-        !!! warning
-            Computation of the folded flux is not implemented yet. Feel free to open an
-            [issue](https://github.com/renecotyfanboy/jaxspec/issues) in the GitHub repository.
         """
-
-        energy_grid = np.linspace(e_min, e_max, n_grid)
-
-        @jax.jit
-        @jnp.vectorize
-        def vectorized_flux(*pars):
-            parameters_pytree = jax.tree.unflatten(pytree_def, pars)
-            return self.model.energy_flux(
-                parameters_pytree, energy_grid[:-1], energy_grid[1:], n_points=n_points
-            )
-
-        flat_tree, pytree_def = jax.tree.flatten(self.input_parameters)
-        flux = vectorized_flux(*flat_tree).sum(axis=-1)  # Sum over all bins
-        conversion_factor = float((u.keV / u.cm**2 / u.s).to(unit))
-        value = np.asarray(flux * conversion_factor)
+        flux = self.model.integrated_flux(
+            e_min,
+            e_max,
+            params=self.spectrum_parameters,
+            energy=True,
+            n_points=n_points,
+            n_grid=n_grid,
+        )
+        value = np.asarray(flux * float((u.keV / u.cm**2 / u.s).to(unit)))
 
         if register:
-            # We handle the case where a parameter is split for multiple observables, hence giving multiple fluxes
-            # Unstable, will change in a future release with better handling for split parameters
-            extra_coords = tuple(
-                coord for coord in self.inference_data.posterior.coords if coord.startswith("mod")
-            )
-
-            self.inference_data.posterior[f"mod/~/energy_flux_{e_min:.1f}_{e_max:.1f}"] = (
-                ("chain", "draw", *extra_coords),
+            self._register_derived_parameter(
+                f"derived.energy_flux_{e_min:.1f}_{e_max:.1f}",
                 value,
             )
 
@@ -292,17 +270,15 @@ class FitResult:
         Parameters:
             e_min: The lower bound of the energy band.
             e_max: The upper bound of the energy band.
-            redshift: The redshift of the source. It can be a distribution of redshifts.
-            observer_frame: Whether the input bands are defined in observer frame or not.
+            redshift: The redshift of the source. Incompatible with distance.
+            distance: The distance of the source (multiplied by an astropy.unit). Incompatible with redshift.
+            observer_frame: Whether the input bands are defined in the observer frame or not.
             cosmology: Chosen cosmology.
             unit: The unit of the luminosity.
             register: Whether to register the flux with the other posterior parameters.
             n_points: The number of points per bin to use for computing the unfolded spectrum.
             n_grid: The number of grid points to use for computing the unfolded spectrum.
         """
-
-        energy_grid = np.linspace(e_min, e_max, n_grid)
-
         if not observer_frame:
             raise NotImplementedError()
 
@@ -312,55 +288,47 @@ class FitResult:
         if distance is not None:
             if redshift is not None:
                 raise ValueError("Redshift must be None as a distance is specified.")
-            else:
-                redshift = distance.to(
-                    cu.redshift, cu.redshift_distance(cosmology, kind="luminosity")
-                ).value
+            redshift = distance.to(
+                cu.redshift, cu.redshift_distance(cosmology, kind="luminosity")
+            ).value
 
-        @jax.jit
-        @jnp.vectorize
-        def vectorized_flux(*pars):
-            parameters_pytree = jax.tree.unflatten(pytree_def, pars)
-            return self.model.energy_flux(
-                parameters_pytree,
-                energy_grid[:-1] * (1 + redshift),
-                energy_grid[1:] * (1 + redshift),
-                n_points=n_points,
-            )
-
-        flat_tree, pytree_def = jax.tree.flatten(self.input_parameters)
-        flux = vectorized_flux(*flat_tree).sum(axis=-1) * (u.keV / u.cm**2 / u.s)
+        flux = self.model.integrated_flux(
+            e_min * (1 + redshift),
+            e_max * (1 + redshift),
+            params=self.spectrum_parameters,
+            energy=True,
+            n_points=n_points,
+            n_grid=n_grid,
+        ) * (u.keV / u.cm**2 / u.s)
         value = np.asarray(
             (flux * (4 * np.pi * cosmology.luminosity_distance(redshift) ** 2)).to(unit)
         )
 
         if register:
-            # We handle the case where a parameter is split for multiple observables, hence giving multiple fluxes
-            # Unstable, will change in a future release with better handling for split parameters
-            extra_coords = tuple(
-                coord for coord in self.inference_data.posterior.coords if coord.startswith("mod")
-            )
-
-            self.inference_data.posterior[f"mod/~/luminosity_{e_min:.1f}_{e_max:.1f}"] = (
-                ("chain", "draw", *extra_coords),
+            self._register_derived_parameter(
+                f"derived.luminosity_{e_min:.1f}_{e_max:.1f}",
                 value,
             )
 
         return value
 
-    def to_chain(self, name: str, parameter_kind="mod") -> Chain:
+    def to_chain(self, name: str) -> Chain:
         """
         Return a ChainConsumer Chain object from the posterior distribution of the parameters_type.
 
         Parameters:
             name: The name of the chain.
-            parameter_kind: The kind of parameters to keep.
         """
+
+        # TODO : we should be able to get parameter from instrument model or background model
+        fm = self.bayesian_fitter.forward_model
 
         keys_to_drop = [
             key
             for key in self.inference_data.posterior.keys()
-            if not key.startswith(parameter_kind)
+            if not (
+                str(key).startswith(fm.spectrum.prior_prefix) or str(key).startswith("derived.")
+            )
         ]
 
         reduced_id = az.extract(
@@ -388,7 +356,8 @@ class FitResult:
 
         df = pd.concat(df_list, axis=1)
 
-        df = df.rename(columns=lambda x: x.split("/~/")[-1])
+        # Remove the prefix "spectrum" / "instrument" / "background"
+        df = df.rename(columns=lambda colname: colname.split(".", maxsplit=1)[1])
 
         return Chain(samples=df, name=name)
 
@@ -416,19 +385,43 @@ class FitResult:
         for bins with no counts
 
         """
+        # TODO : add a test against XSPEC to check for this. There will be a hard time handling and determining wether or not the background should be accounted for here
+        observed_data = self.inference_data.observed_data
+        log_likelihood = self.log_likelihood
+        c_stat_data_vars: dict[str, xr.DataArray] = {}
 
-        exclude_dims = ["chain", "draw", "sample"]
-        all_dims = list(self.inference_data.log_likelihood.dims)
-        reduce_dims = [dim for dim in all_dims if dim not in exclude_dims]
-        data = self.inference_data.observed_data
-        c_stat = -2 * (
-            self.log_likelihood
-            + (gammaln(data + 1) - (xr.where(data > 0, data * (np.log(data) - 1), 0))).sum(
-                dim=reduce_dims
-            )
-        )
+        for var_name, data in observed_data.data_vars.items():
+            safe_data = xr.where(data > 0, data, 1)
+            saturated = gammaln(data + 1) - xr.where(data > 0, data * (np.log(safe_data) - 1), 0)
+            constant = saturated.sum(dim=list(data.dims)) if data.dims else saturated
+            c_stat_data_vars[var_name] = -2 * (log_likelihood[var_name] + constant)
 
-        return c_stat
+        all_c_stat_vars = dict(c_stat_data_vars)
+
+        if len(c_stat_data_vars) > 1:
+            all_c_stat_vars["full"] = xr.concat(
+                list(c_stat_data_vars.values()), dim="_cstat_component"
+            ).sum("_cstat_component")
+
+            observed_terms = [
+                value for key, value in c_stat_data_vars.items() if key.startswith("observed.")
+            ]
+            if observed_terms:
+                all_c_stat_vars["observed.all"] = xr.concat(
+                    observed_terms, dim="_cstat_component"
+                ).sum("_cstat_component")
+
+            background_terms = [
+                value
+                for key, value in c_stat_data_vars.items()
+                if key.startswith("observed_background.")
+            ]
+            if background_terms:
+                all_c_stat_vars["observed_background.all"] = xr.concat(
+                    background_terms, dim="_cstat_component"
+                ).sum("_cstat_component")
+
+        return xr.Dataset(all_c_stat_vars)
 
     def plot_ppc(
         self,
@@ -446,6 +439,8 @@ class FitResult:
         figsize: tuple[float, float] = (6, 6),
         x_lims: tuple[float, float] | None = None,
         rescale_background: bool = False,
+        min_counts: int | None = None,
+        grouping: int | None = None,
     ) -> list[plt.Figure]:
         r"""
         Plot the posterior predictive distribution of the model. It also features a residual plot, defined using the
@@ -467,10 +462,15 @@ class FitResult:
             figsize: The size of the figure.
             x_lims: The limits of the x-axis.
             rescale_background: Whether to rescale the background model to the data with backscal ratio.
+            min_counts: Minimum number of observed counts per grouped bin. Adjacent bins are merged until the threshold is reached. Mutually exclusive with *grouping*.
+            grouping: Number of consecutive bins to merge into each group. Mutually exclusive with *min_counts*.
 
         Returns:
             A list of matplotlib figures for each observation in the model.
         """
+
+        if min_counts is not None and grouping is not None:
+            raise ValueError("min_counts and grouping are mutually exclusive")
 
         obsconf_container = self.obsconfs
         figure_list = []
@@ -504,10 +504,30 @@ class FitResult:
                 legend_labels = []
 
                 count = az.extract(
-                    self.inference_data, var_names=f"obs/~/{obs_id}", group="posterior_predictive"
+                    self.inference_data,
+                    var_names=f"observed.{obs_id}",
+                    group="posterior_predictive",
                 ).values.T
 
                 xbins, exposure, integrated_arf = _compute_effective_area(obsconf, x_unit)
+                observed_counts = obsconf.folded_counts.data
+
+                # --- Adaptive rebinning ---
+                if min_counts is not None:
+                    bin_ids = adaptive_bin_1d(observed_counts, min_counts)
+                elif grouping is not None:
+                    n_bins = len(observed_counts)
+                    bin_ids = np.arange(n_bins) // grouping
+                else:
+                    bin_ids = None
+
+                if bin_ids is not None:
+                    count = rebin_counts(count, bin_ids)
+                    observed_counts = rebin_counts(observed_counts, bin_ids)
+                    xbins = _rebin_xbins(xbins, bin_ids)
+                    integrated_arf = (
+                        rebin_counts(integrated_arf.value, bin_ids) * integrated_arf.unit
+                    )
 
                 match y_type:
                     case "counts":
@@ -524,7 +544,7 @@ class FitResult:
                 y_samples = y_samples.to(y_units)
 
                 y_observed, y_observed_low, y_observed_high = _error_bars_for_observed_data(
-                    obsconf.folded_counts.data, denominator, y_units
+                    observed_counts, denominator, y_units
                 )
 
                 # Use the helper function to plot the data and posterior predictive
@@ -556,7 +576,7 @@ class FitResult:
                 legend_labels.append("Model")
 
                 # Plot the residuals
-                residual_samples = (obsconf.folded_counts.data - count) / np.diff(
+                residual_samples = (observed_counts - count) / np.diff(
                     np.percentile(count, [16, 84], axis=0), axis=0
                 )
 
@@ -570,15 +590,16 @@ class FitResult:
                 )
 
                 if plot_components:
-                    for (component_name, count), color in zip(
+                    for (component_name, comp_count), color in zip(
                         self._ppc_folded_branches(obs_id).items(), COLOR_CYCLE
                     ):
                         # _ppc_folded_branches returns (n_chains, n_draws, n_bins) shaped arrays so we must flatten it
-                        y_samples = (
-                            count.reshape((count.shape[0] * count.shape[1], -1))
-                            * u.ct
-                            / denominator
+                        comp_flat = comp_count.reshape(
+                            (comp_count.shape[0] * comp_count.shape[1], -1)
                         )
+                        if bin_ids is not None:
+                            comp_flat = rebin_counts(comp_flat, bin_ids)
+                        y_samples = comp_flat * u.ct / denominator
 
                         y_samples = y_samples.to(y_units)
 
@@ -604,21 +625,31 @@ class FitResult:
                         if self.background_model is None
                         else az.extract(
                             self.inference_data,
-                            var_names=f"bkg/~/{obs_id}",
+                            var_names=f"observed_background.{obs_id}",
                             group="posterior_predictive",
                         ).values.T
                     )
 
+                    bkg_observed = obsconf.folded_background.data
+
+                    if bin_ids is not None:
+                        bkg_count = rebin_counts(bkg_count, bin_ids)
+                        bkg_observed = rebin_counts(bkg_observed, bin_ids)
+                        rescale_background_factor = (
+                            rebin_counts(obsconf.folded_backratio.data, bin_ids)
+                            / np.bincount(bin_ids)
+                            if rescale_background
+                            else 1.0
+                        )
+                    else:
+                        rescale_background_factor = (
+                            obsconf.folded_backratio.data if rescale_background else 1.0
+                        )
+
                     y_samples_bkg = (bkg_count * u.ct / denominator).to(y_units)
 
                     y_observed_bkg, y_observed_bkg_low, y_observed_bkg_high = (
-                        _error_bars_for_observed_data(
-                            obsconf.folded_background.data, denominator, y_units
-                        )
-                    )
-
-                    rescale_background_factor = (
-                        obsconf.folded_backratio.data if rescale_background else 1.0
+                        _error_bars_for_observed_data(bkg_observed, denominator, y_units)
                     )
 
                     model_bkg_plot = _plot_binned_samples_with_error(
@@ -663,7 +694,7 @@ class FitResult:
                     case "frequency":
                         ax[1].set_xlabel(f"Frequency \n[{x_unit:latex_inline}]")
                     case _:
-                        RuntimeError(
+                        raise RuntimeError(
                             f"Unknown physical type for x_units: {x_unit}. "
                             f"Must be 'length', 'energy' or 'frequency'"
                         )
