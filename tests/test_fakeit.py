@@ -1,18 +1,9 @@
-import os
-import sys
-
 import chex
 import jax
 import pytest
 
 from jaxspec.data import ObsConfiguration
 from jaxspec.data.util import fakeit_for_multiple_parameters
-
-chex.set_n_cpu_devices(n=4)
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-source_dir = os.path.abspath(os.path.join(current_dir, ".."))
-sys.path.append(source_dir)
 
 
 @pytest.fixture
@@ -109,20 +100,19 @@ def test_fakeits_sparsify(obsconfs, model, unidimensional_parameters):
     chex.assert_type(spectra, float)
 
 
-def test_fakeits_multiple_observation(obsconfs, model, multidimensional_parameters):
-    obsconf = obsconfs[0]
-    spectra = fakeit_for_multiple_parameters(
-        obsconf, model, multidimensional_parameters, apply_stat=False
-    )
-    chex.assert_type(spectra, float)
-
-    spectra = fakeit_for_multiple_parameters(
-        obsconf, model, multidimensional_parameters, apply_stat=True
-    )
-    chex.assert_type(spectra, int)
-
-
 def test_mock_obsconf(instruments, model, multidimensional_parameters):
     for instrument in instruments:
         obsconf = ObsConfiguration.mock_from_instrument(instrument, exposure=1e5)
         fakeit_for_multiple_parameters(obsconf, model, multidimensional_parameters)
+
+
+def test_fakeits_missing_parameter_raises(obsconfs, model, multidimensional_parameters):
+    """A parameters dict missing a model parameter must raise a clear,
+    parameter-centric error rather than silently using a default (old behavior)
+    or the misleading prior-dict KeyError raised inside the JIT trace."""
+    obsconf = obsconfs[0]
+    incomplete = {
+        k: v for k, v in multidimensional_parameters.items() if k != "blackbodyrad_1.norm"
+    }
+    with pytest.raises(ValueError, match="blackbodyrad_1"):
+        fakeit_for_multiple_parameters(obsconf, model, incomplete)

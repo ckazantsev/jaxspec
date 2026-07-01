@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import operator
 
 from collections.abc import Callable
@@ -9,9 +11,12 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 import numpyro
+import numpyro.distributions as dist
 
+from flax import nnx
 from jax import Array
-from jax.random import key
+from jax.random import key as rng_key
+from jaxtyping import ArrayLike
 from numpyro.distributions import Poisson, TransformedDistribution
 from numpyro.infer import Predictive
 from numpyro.infer.inspect import get_model_relations
@@ -19,19 +24,28 @@ from numpyro.infer.reparam import TransformReparam
 from numpyro.infer.util import log_density
 
 from ..analysis._plot import (
+    _compute_bin_ids,
     _error_bars_for_observed_data,
     _plot_binned_samples_with_error,
     _plot_poisson_data_with_error,
     _rebin_xbins,
-    adaptive_bin_1d,
     rebin_counts,
 )
 from ..data import ObsConfiguration
-from ..model.abc import SpectralModel
+from ..model.abc import ModelComponent, SpectralModel
 from ..model.background import BackgroundModel
 from ..model.instrument import InstrumentModel
-from ..util.typing import PriorDictType
 from ._forward_model import ForwardModel
+from ._parameter import TiedParameter
+from ._prior_resolution import (
+    _KNOWN_PREFIXES,
+    _enumerate_leaves,
+    _prefix_to_obs_names,
+    _resolve_targets,
+    _unmatched_key_message,
+    parse_prior_key,
+    sample_prior,
+)
 
 
 class BayesianModel:
@@ -40,38 +54,35 @@ class BayesianModel:
     numpyro priors and Poisson likelihoods.
 
     Parameters:
-        model: The spectral model to fit.
-        prior_distributions: Unified dictionary mapping parameter names to
-            numpyro distributions, fixed values,
-            :class:`~jaxspec.fit.TiedParameter`, or
-            :class:`~jaxspec.fit.PerObs` wrappers.
-
-            Dict keys are routed by prefix:
-
-            - ``"spectrum."`` prefix (e.g. ``"spectrum.powerlaw_1.alpha"``) →
-              spectral model.
-            - ``"instrument."`` prefix (e.g. ``"instrument.gain.factor"``) →
-              instrument model.
-            - ``"background."`` prefix (e.g.
-              ``"background.powerlaw_1.alpha"``) → background model.
-        observations: One or more observation configurations. Accepts a single
-            :class:`~jaxspec.data.ObsConfiguration`, a list (auto-named
-            ``data_0``, ``data_1``, ...), or a ``{name: obs}`` dict.
-        background_model: Optional background model.
-        instrument_model: Optional instrument calibration model.
+        model: The spectral model to fit (cloned per observation inside the
+            internal :class:`~jaxspec.fit._forward_model.ForwardModel`). A single
+            bare component (e.g. ``Powerlaw()``) is accepted and auto-wrapped via
+            :meth:`~jaxspec.model.abc.SpectralModel.from_component`.
+        prior: Either a unified prior dict using the ``[obs]`` / ``[*]``
+            scoping syntax (see module docs), or a factory callable
+            ``() -> ((leaf_path, shape) -> Distribution)``. The factory form
+            runs inside the numpyro trace, letting it sample shared /
+            hierarchical params before returning the leaf callable.
+        observations: One or more observation configurations.
+        background_model: ``None``, a singleton ``BackgroundModel``, or a
+            ``{obs_name: BackgroundModel | None}`` dict.
+        instrument_model: ``None``, or a ``{obs_name: InstrumentModel | None}``
+            dict. ``None`` entries (and observations omitted from the dict)
+            apply the identity fold (no instrument calibration).
         sparsify_matrix: Whether to use sparse transfer matrices.
         n_points: Number of quadrature points per energy bin.
     """
 
     def __init__(
         self,
-        model: SpectralModel,
-        prior_distributions: PriorDictType,
+        model: SpectralModel | ModelComponent,
+        prior: dict | Callable,
         observations: ObsConfiguration | list[ObsConfiguration] | dict[str, ObsConfiguration],
-        background_model: BackgroundModel | None = None,
-        instrument_model: InstrumentModel | None = None,
+        background_model: BackgroundModel | dict[str, BackgroundModel | None] | None = None,
+        instrument_model: dict[str, InstrumentModel | None] | None = None,
         sparsify_matrix: bool = False,
         n_points: int = 2,
+        energy_grid: ArrayLike | None = None,
     ):
         self.forward_model = ForwardModel(
             model,
@@ -80,154 +91,223 @@ class BayesianModel:
             instrument_model=instrument_model,
             sparsify_matrix=sparsify_matrix,
             n_points=n_points,
+            energy_grid=energy_grid,
         )
-        self._prior = dict(prior_distributions)
+
+        self._user_prior = prior
         self._effective_prior = self._build_prior_dict()
+        self._validate_prior_dict()
+
+        # Tell the ForwardModel whether the eval-once-then-fold fast path is
+        # safe for this fit. Only safe when an explicit energy_grid is set AND
+        # every spectral prior entry is shared (no [obs] / [*] scopes), since
+        # any per-obs spectral param means each replica produces a different
+        # flux on the grid. Callable priors are conservatively treated as
+        # non-shared (we can't statically inspect them).
+        self.forward_model.settings["spectrum_shared"] = self._spectrum_is_shared()
 
     @property
     def spectral_model(self) -> SpectralModel:
+        """A representative spectral model replica (PN's, or whichever obs is first).
+
+        All per-obs replicas share the same structure; this is provided for
+        callers (e.g. :class:`~jaxspec.analysis.results.FitResult`) that want
+        a single ``SpectralModel`` to introspect topology or compute fluxes.
+        Per-obs *parameter values* live on the bound replicas after sampling.
+        """
+        return next(iter(self.forward_model.spectrum.values()))
+
+    @property
+    def spectrum(self) -> dict[str, SpectralModel]:
+        """Per-obs replicas of the spectral model held on the ForwardModel."""
         return self.forward_model.spectrum
 
     @property
-    def background_model(self) -> BackgroundModel | None:
-        return self.forward_model.background_model
+    def instrument(self) -> dict[str, InstrumentModel]:
+        return self.forward_model.instrument
 
     @property
-    def instrument_model(self) -> InstrumentModel | None:
-        return self.forward_model.instrument_model
+    def background(self) -> dict[str, BackgroundModel]:
+        return self.forward_model.background
 
     @property
     def settings(self) -> dict[str, Any]:
         return self.forward_model.settings
 
-    @staticmethod
-    def _validate_prior_dict(prior: dict, observation_names: list[str]) -> None:
-        from ._parameter import PerObs, TiedParameter
+    # ----- Prior dict validation + default-merge -----
 
-        def _validate_leaf(site_name: str, value) -> None:
-            if isinstance(value, PerObs):
-                raise TypeError(f"PerObs inside PerObs is not supported (at {site_name!r}).")
-            if isinstance(value, TiedParameter):
-                raise TypeError(f"TiedParameter inside PerObs is not supported (at {site_name!r}).")
-            if isinstance(value, numpyro.distributions.Distribution):
-                return
-            try:
-                jnp.asarray(value)
-            except Exception as exc:
-                raise TypeError(f"Invalid fixed prior value for {site_name!r}: {value!r}") from exc
+    def _build_prior_dict(self) -> dict | Callable:
+        """Merge per-obs background and instrument defaults into the user prior
+        (user wins). For callable priors, pass through unchanged."""
+        if not isinstance(self._user_prior, dict):
+            return self._user_prior
 
-        required = set(observation_names)
-
-        for site_name, entry in prior.items():
-            if isinstance(entry, TiedParameter):
-                continue
-
-            if not isinstance(entry, PerObs):
-                if not isinstance(entry, numpyro.distributions.Distribution):
-                    try:
-                        jnp.asarray(entry)
-                    except Exception as exc:
-                        raise TypeError(
-                            f"Invalid fixed prior value for {site_name!r}: {entry!r}"
-                        ) from exc
-                continue
-
-            if entry.is_homogeneous:
-                _validate_leaf(site_name, entry.value)
-                continue
-
-            missing = required - set(entry.value.keys())
-            if missing:
-                raise ValueError(
-                    f"PerObs entry for {site_name!r} is missing observations: {sorted(missing)}"
-                )
-            for obs_name in observation_names:
-                _validate_leaf(f"{site_name}.{obs_name}", entry.value[obs_name])
-
-    def _build_prior_dict(self) -> dict:
-        """Return the validated prior dict used to sample/extract parameters.
-
-        Merges the background model's ``default_prior`` (user entries win on
-        collision), then validates the resulting dict against the observations.
-        """
-        prior = self._prior
-        fm = self.forward_model
-        if fm.background_model is not None:
-            defaults = fm.background_model.default_prior(fm.observations)
-            prior = {**defaults, **prior}
-
-        self._validate_prior_dict(prior, list(fm.observations.keys()))
+        prior = dict(self._user_prior)
+        for modules in (self.forward_model.background, self.forward_model.instrument):
+            for obs_name, module in modules.items():
+                obs = self.forward_model.observations[obs_name]
+                for key, value in module.default_prior(obs, obs_name).items():
+                    prior.setdefault(key, value)
         return prior
 
-    def _sample_priors(self) -> tuple[dict, dict | None, dict | None]:
-        """Sample the priors for spectrum, instrument, background.
+    def _applicable_obs(self, prefix: str) -> set[str]:
+        return set(_prefix_to_obs_names(self.forward_model).get(prefix, []))
 
-        Returns a ``(source_params, instrument_params, background_params)``
-        tuple. ``instrument_params`` / ``background_params`` are ``None`` when
-        the corresponding model is absent.
+    def _validate_prior_dict(self) -> None:
+        """Validate the (effective) prior dict against the forward model.
+
+        Callable priors are not validated structurally — the user is on the hook
+        for their callable's correctness.
         """
-        fm = self.forward_model
-        obs_names = list(fm.observations.keys())
+        if not isinstance(self._effective_prior, dict):
+            return
+        leaves = _enumerate_leaves(self.forward_model)
+        applicable = {prefix: self._applicable_obs(prefix) for prefix in _KNOWN_PREFIXES}
+        for raw_key, value in self._effective_prior.items():
+            self._validate_prior_entry(raw_key, value, leaves, applicable)
 
-        prior = self._effective_prior
-        source_params = fm.spectrum.register_priors(prior, obs_names)
-        instrument_params = (
-            fm.instrument_model.register_priors(prior, obs_names)
-            if fm.instrument_model is not None
-            else None
-        )
-        background_params = (
-            fm.background_model.register_priors(prior, obs_names)
-            if fm.background_model is not None
-            else None
-        )
-        return source_params, instrument_params, background_params
+    def _validate_prior_entry(self, raw_key, value, leaves, applicable_by_prefix) -> None:
+        # Catch flat keys like "tbabs_1_nh" before parse_prior_key — the
+        # regex would accept them but downstream errors would be cryptic.
+        if "." not in raw_key.split("[", 1)[0]:
+            raise ValueError(
+                f"Prior key {raw_key!r} has no module prefix. Expected a "
+                f"dotted path like 'spectrum.<component>.<param>' (or "
+                f"'instrument.<...>' / 'background.<...>'), optionally with "
+                f"an [obs] or [*] suffix."
+            )
+
+        path, scope = parse_prior_key(raw_key)
+        prefix = path.split(".", 1)[0]
+
+        if prefix not in _KNOWN_PREFIXES:
+            raise ValueError(
+                f"Prior key {raw_key!r} starts with unknown module {prefix!r}. "
+                f"The first dotted segment must be one of {_KNOWN_PREFIXES}. "
+                f"Did you mean 'spectrum.{path}'?"
+            )
+
+        applicable = applicable_by_prefix[prefix]
+        if not applicable:
+            hint = (
+                "Did you forget to pass instrument_model= to the fitter?"
+                if prefix == "instrument"
+                else "Did you forget to pass background_model= to the fitter?"
+                if prefix == "background"
+                else ""
+            )
+            raise ValueError(
+                f"Prior key {raw_key!r} has prefix {prefix!r} but no observations "
+                f"are attached to the {prefix!r} model. {hint}".rstrip()
+            )
+        if scope is not None and scope != "*" and scope not in applicable:
+            raise ValueError(
+                f"Prior key {raw_key!r} references observation {scope!r} which is "
+                f"not in the {prefix!r} applicable set {sorted(applicable)}."
+            )
+        # Strict leaf-existence check: a key that resolves to zero leaves is a
+        # typo'd parameter path — surface it at build time, not silently drop it.
+        if not _resolve_targets(path, scope, leaves, applicable_by_prefix):
+            raise KeyError(_unmatched_key_message(path, scope, leaves))
+        if isinstance(value, dist.Distribution | TiedParameter):
+            return
+        try:
+            jnp.asarray(value)
+        except Exception as exc:
+            raise TypeError(f"Invalid fixed prior value for {raw_key!r}: {value!r}") from exc
+
+    # ----- numpyro model wiring -----
 
     def numpyro_model(self, observed: bool = True):
-        """Build the full numpyro model: source + instrument + background + likelihoods.
+        """Sample the prior, evaluate the forward model, register likelihoods.
 
-        Parameters:
-            observed: If ``True``, condition on the observed data (fitting mode).
-                If ``False``, sample from the prior predictive distribution.
+        Thin wrapper around :meth:`ForwardModel.evaluate`: this method owns
+        only the numpyro-specific concerns (sample sites + Poisson
+        likelihoods on the observed counts). The deterministic forward pass
+        — spectral evaluation, instrument folding, background — lives on
+        the forward model and is reused by ``fakeit`` and posterior-predictive
+        checks.
         """
+        inputs = self._sample_inputs()
+
+        # Clone the forward_model per call so each evaluate sees a fresh tree
+        # (the original module's Variables would otherwise accumulate tracers
+        # across MCMC's repeated traces, surfacing as UnexpectedTracerError).
+        # ``evaluate`` itself does NOT clone — that would break ``jax.vmap``.
+        fresh_forward = nnx.clone(self.forward_model)
+        predictions = fresh_forward.evaluate(inputs, missing_key_style="prior")
+
         fm = self.forward_model
-        source_params, instrument_params, background_params = self._sample_priors()
+        for obs_name, obs in fm.observations.items():
+            source_flux = predictions[obs_name]["source"]
+            bkg_rate = predictions[obs_name]["background"]
+            bg = fm.background.get(obs_name)
 
-        per_obs = fm.expected_counts(
-            source_params=source_params,
-            instrument_params=instrument_params,
-            background_params=background_params,
-        )
-
-        # Background observation sites (stochastic) or deterministic record
-        if fm.background_model is not None:
-            for name, obs in fm.observations.items():
+            if bkg_rate is not None:
                 if getattr(obs, "folded_background", None) is None:
                     raise ValueError(
                         "Trying to fit a background model but no background is "
                         "linked to this observation"
                     )
-                bkg_rate = per_obs[name]["background_rate"]
-                if fm.background_model.is_stochastic:
+                bkg_in_obs = bkg_rate * obs.folded_backratio.data
+                total = source_flux + bkg_in_obs
+
+                if bg.is_stochastic:
                     with numpyro.plate(
-                        f"observed_background_plate.{name}", len(obs.folded_background)
+                        f"observed_background_plate.{obs_name}", len(obs.folded_background)
                     ):
                         numpyro.sample(
-                            f"observed_background.{name}",
+                            f"observed_background.{obs_name}",
                             Poisson(bkg_rate),
                             obs=obs.folded_background.data if observed else None,
                         )
                 else:
-                    numpyro.deterministic(f"observed_background.{name}", bkg_rate)
+                    numpyro.deterministic(f"observed_background.{obs_name}", bkg_rate)
+            else:
+                total = source_flux
 
-        # Source observation sites
-        for name, obs in fm.observations.items():
-            with numpyro.plate(f"observed_plate.{name}", len(obs.folded_counts)):
+            with numpyro.plate(f"observed_plate.{obs_name}", len(obs.folded_counts)):
                 numpyro.sample(
-                    f"observed.{name}",
-                    Poisson(per_obs[name]["total"]),
+                    f"observed.{obs_name}",
+                    Poisson(total),
                     obs=obs.folded_counts.data if observed else None,
                 )
+
+    # ----- Prior sampling -----
+
+    def _sample_inputs(self) -> dict[str, Any]:
+        """Sample the (effective) prior into the leaf-path inputs dict that
+        :meth:`ForwardModel.evaluate` consumes.
+
+        Creates the per-leaf numpyro sample sites along the way. Thin wrapper
+        around :func:`~jaxspec.fit._prior_resolution.sample_prior` that
+        provides the prefix → applicable-obs table built from
+        :meth:`_applicable_obs`.
+        """
+        applicable = {prefix: self._applicable_obs(prefix) for prefix in _KNOWN_PREFIXES}
+        return sample_prior(self.forward_model, self._effective_prior, applicable)
+
+    def _spectrum_is_shared(self) -> bool:
+        """Whether every spectral prior entry is shared across obs.
+
+        Used at construction time to set :attr:`ForwardModel.settings`'s
+        ``"spectrum_shared"`` flag, which lets :meth:`ForwardModel.evaluate`
+        evaluate the spectrum **once** when a user energy grid is set
+        (otherwise each obs's per-obs replica must be evaluated separately,
+        e.g. when any spectral param has a ``[*]`` / ``[obs]`` scope).
+
+        Conservative: callable priors return ``False`` since we cannot
+        statically inspect them.
+        """
+        if not isinstance(self._effective_prior, dict):
+            return False
+        for raw_key in self._effective_prior:
+            path, scope = parse_prior_key(raw_key)
+            if path.startswith("spectrum.") and scope is not None:
+                return False
+        return True
+
+    # ----- Cached properties for fitter machinery -----
 
     @cached_property
     def transformed_numpyro_model(self) -> Callable:
@@ -247,9 +327,7 @@ class BayesianModel:
 
     @cached_property
     def log_likelihood_per_obs(self) -> Callable:
-        """
-        Build the log likelihood function for each bins in each observation.
-        """
+        """Build the log likelihood function for each bin in each observation."""
 
         @jax.jit
         def log_likelihood_per_obs(constrained_params):
@@ -262,10 +340,7 @@ class BayesianModel:
 
     @cached_property
     def log_likelihood(self) -> Callable:
-        """
-        Build the total log likelihood function. Takes a dictionary of parameters where the keys are the parameter names
-        that can be fetched with the [`parameter_names`][jaxspec.fit.BayesianModel.parameter_names].
-        """
+        """Build the total log likelihood function."""
 
         @jax.jit
         def log_likelihood(constrained_params):
@@ -276,72 +351,61 @@ class BayesianModel:
 
     @cached_property
     def log_posterior_prob(self) -> Callable:
-        """
-        Build the posterior probability. Takes a dictionary of parameters where the keys are the parameter names
-        that can be fetched with the [`parameter_names`][jaxspec.fit.BayesianModel.parameter_names].
-        """
+        """Build the posterior probability function.
 
-        # This is required as numpyro.infer.util.log_densities does not check parameter validity by itself
-        numpyro.enable_validation()
+        Enables distribution validation only during this trace so that
+        out-of-support parameter values produce ``-inf`` log-probabilities
+        (instead of silently bogus finite values), letting external samplers
+        such as AIES / ESS / MH correctly reject them.
+
+        We don't use ``numpyro.validation_enabled()`` because that context
+        manager has an upstream bug: it saves ``_VALIDATION_ENABLED`` (a
+        module-global) but restores via ``enable_validation`` which writes
+        to *both* that global *and* ``Distribution._validate_args`` — and
+        those two can be out of sync (they are at fresh import). The
+        manual save/restore below targets ``Distribution._validate_args``
+        directly, which is the attribute every ``Distribution`` instance
+        actually reads at construction time.
+        """
 
         @jax.jit
         def log_posterior_prob(constrained_params):
-            log_posterior_prob, _ = log_density(
-                self.numpyro_model, (), dict(observed=True), constrained_params
-            )
+            with numpyro.validation_enabled(True):
+                log_posterior_prob, _ = log_density(
+                    self.numpyro_model, (), dict(observed=True), constrained_params
+                )
+
             return jnp.where(jnp.isnan(log_posterior_prob), -jnp.inf, log_posterior_prob)
 
         return log_posterior_prob
 
     @cached_property
     def parameter_names(self) -> list[str]:
-        """
-        List of parameter names for the model.
-        """
+        """List of parameter names for the model."""
         relations = get_model_relations(self.numpyro_model)
         all_sites = relations["sample_sample"].keys()
         observed_sites = relations["observed"]
-        return [site for site in all_sites if site not in observed_sites]
+        return sorted(site for site in all_sites if site not in observed_sites)
 
     @cached_property
     def observation_names(self) -> list[str]:
-        """
-        List of the observations.
-        """
+        """List of the observations."""
         relations = get_model_relations(self.numpyro_model)
         all_sites = relations["sample_sample"].keys()
         observed_sites = relations["observed"]
-        return [site for site in all_sites if site in observed_sites]
+        return sorted(site for site in all_sites if site in observed_sites)
 
     def array_to_dict(self, theta):
-        """
-        Convert an array of parameters to a dictionary of parameters.
-        """
-        input_params = {}
-
-        for index, parameter_key in enumerate(self.parameter_names):
-            input_params[parameter_key] = theta[index]
-
-        return input_params
+        return {name: theta[i] for i, name in enumerate(self.parameter_names)}
 
     def dict_to_array(self, dict_of_params):
-        """
-        Convert a dictionary of parameters to an array of parameters.
-        """
-
         theta = jnp.zeros(len(self.parameter_names))
         for index, parameter_key in enumerate(self.parameter_names):
             theta = theta.at[index].set(dict_of_params[parameter_key])
         return theta
 
-    def prior_samples(self, key: Array = key(0), num_samples: int = 100):
-        """
-        Get initial parameters for the model by sampling from the prior distribution
-
-        Parameters:
-            key: the random key used to initialize the sampler.
-            num_samples: the number of samples to draw from the prior.
-        """
+    def prior_samples(self, key: Array = rng_key(0), num_samples: int = 100):
+        """Sample from the prior distribution."""
 
         @jax.jit
         def prior_sample(key):
@@ -351,7 +415,7 @@ class BayesianModel:
 
         return prior_sample(key)
 
-    def mock_observations(self, parameters, key: Array = key(0)):
+    def mock_observations(self, parameters, key: Array = rng_key(0)):
         @jax.jit
         def fakeit(key, parameters):
             return Predictive(
@@ -364,23 +428,12 @@ class BayesianModel:
 
     def prior_predictive_coverage(
         self,
-        key: Array = key(0),
+        key: Array = rng_key(0),
         num_samples: int = 1000,
         min_counts: int | None = None,
         grouping: int | None = None,
     ):
-        """
-        Check if the prior distribution includes the observed data.
-
-        Parameters:
-            key: Random key for sampling.
-            num_samples: Number of prior predictive samples.
-            min_counts: Minimum number of observed counts per grouped bin.
-                Adjacent bins are merged until the threshold is reached.
-                Mutually exclusive with *grouping*.
-            grouping: Number of consecutive bins to merge into each group.
-                Mutually exclusive with *min_counts*.
-        """
+        """Check if the prior distribution includes the observed data."""
         if min_counts is not None and grouping is not None:
             raise ValueError("min_counts and grouping are mutually exclusive")
 
@@ -400,13 +453,7 @@ class BayesianModel:
             counts = np.asarray(posterior_observations[f"observed.{key}"])
             out_energies = value.out_energies
 
-            if min_counts is not None:
-                bin_ids = adaptive_bin_1d(observed, min_counts)
-            elif grouping is not None:
-                n_bins = len(observed)
-                bin_ids = np.arange(n_bins) // grouping
-            else:
-                bin_ids = None
+            bin_ids = _compute_bin_ids(observed, min_counts, grouping)
 
             if bin_ids is not None:
                 observed = rebin_counts(observed, bin_ids)

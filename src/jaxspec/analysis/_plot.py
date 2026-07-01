@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import catppuccin
 import matplotlib.pyplot as plt
 import numpy as np
 
 from astropy import units as u
-from catppuccin.extras.matplotlib import load_color
 from cycler import cycler
 from jax.typing import ArrayLike
 from scipy.integrate import trapezoid
@@ -13,10 +11,27 @@ from scipy.stats import nbinom, norm
 
 from jaxspec.data import ObsConfiguration
 
-PALETTE = catppuccin.PALETTE.latte
+# Catppuccin "Latte" palette (hex), inlined to drop the runtime `catppuccin`
+# dependency, whose import-time matplotlib style registration breaks on
+# matplotlib >= 3.11 (removed matplotlib.style.core).
+_LATTE = {
+    "sky": "#04a5e5",
+    "teal": "#179299",
+    "green": "#40a02b",
+    "yellow": "#df8e1d",
+    "peach": "#fe640b",
+    "maroon": "#e64553",
+    "red": "#d20f39",
+    "pink": "#ea76cb",
+    "mauve": "#8839ef",
+    "blue": "#1e66f5",
+    "sapphire": "#209fb5",
+    "overlay2": "#7c7f93",
+    "overlay0": "#9ca0b0",
+}
 
 COLOR_CYCLE = [
-    load_color(PALETTE.identifier, color)
+    _LATTE[color]
     for color in ["sky", "teal", "green", "yellow", "peach", "maroon", "red", "pink", "mauve"][::-1]
 ]
 
@@ -24,10 +39,10 @@ LINESTYLE_CYCLE = ["dashed", "dotted", "dashdot", "solid"]
 
 SPECS_CYCLE = cycler(linestyle=LINESTYLE_CYCLE) * cycler(color=COLOR_CYCLE)
 
-SPECTRUM_COLOR = load_color(PALETTE.identifier, "blue")
-SPECTRUM_DATA_COLOR = load_color(PALETTE.identifier, "overlay2")
-BACKGROUND_COLOR = load_color(PALETTE.identifier, "sapphire")
-BACKGROUND_DATA_COLOR = load_color(PALETTE.identifier, "overlay0")
+SPECTRUM_COLOR = _LATTE["blue"]
+SPECTRUM_DATA_COLOR = _LATTE["overlay2"]
+BACKGROUND_COLOR = _LATTE["sapphire"]
+BACKGROUND_DATA_COLOR = _LATTE["overlay0"]
 
 
 def sigma_to_percentile_intervals(sigmas):
@@ -151,6 +166,20 @@ def adaptive_bin_1d(counts, min_counts):
         bin_ids[bin_ids == current_bin] = current_bin - 1
 
     return bin_ids
+
+
+def _compute_bin_ids(observed_counts, min_counts, grouping):
+    """Resolve the rebinning policy for an observation.
+
+    ``min_counts`` triggers adaptive merging; ``grouping`` triggers fixed-size
+    groups; both ``None`` returns ``None`` (no rebinning). Mutual exclusion is
+    enforced by the caller.
+    """
+    if min_counts is not None:
+        return adaptive_bin_1d(observed_counts, min_counts)
+    if grouping is not None:
+        return np.arange(len(observed_counts)) // grouping
+    return None
 
 
 def rebin_counts(data, bin_ids):

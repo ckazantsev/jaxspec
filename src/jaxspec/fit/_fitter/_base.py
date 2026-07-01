@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 
 import arviz as az
+import jax
 import numpyro
 
 from jax import Array, random
@@ -8,7 +9,6 @@ from jax.numpy import concatenate
 from numpyro.infer import Predictive
 
 from ...analysis.results import FitResult
-from ...model.background import SubtractedBackground
 from .._bayesian_model import BayesianModel
 
 
@@ -21,6 +21,7 @@ class BayesianModelFitter(BayesianModel, ABC):
         key: Array = random.key(42),
         use_transformed_model: bool = False,
         filter_inference_data: bool = True,
+        consolidate_samples: bool = True,
     ) -> az.InferenceData:
         """
         Build an [InferenceData][arviz.InferenceData] object from posterior samples.
@@ -32,11 +33,20 @@ class BayesianModelFitter(BayesianModel, ABC):
             key: the random key used to initialize the sampler.
             use_transformed_model: whether to use the transformed model to build the InferenceData.
             filter_inference_data: whether to filter the InferenceData to keep only the relevant parameters.
+            consolidate_samples: whether to gather the (possibly device-sharded) posterior samples onto a single device before post-processing. Multi-chain MCMC shards samples across all devices, which inflates peak memory during the predictive/log-likelihood passes; gathering is a no-op on a single device and does not change the results.
         """
 
         numpyro_model = (
             self.transformed_numpyro_model if use_transformed_model else self.numpyro_model
         )
+
+        # Multi-chain MCMC returns samples sharded across every device (num_chains defaults to
+        # len(jax.devices())). The post-processing passes below do not benefit from that
+        # sharding, and mapping over a sharded leading axis inflates peak memory (XLA
+        # materializes per-device temporaries). Gather onto a single device — a no-op when
+        # already single-device, and numerically identical either way.
+        if consolidate_samples:
+            posterior_samples = jax.device_put(posterior_samples, jax.devices()[0])
 
         keys = random.split(key, 3)
 
@@ -54,9 +64,10 @@ class BayesianModelFitter(BayesianModel, ABC):
             )
 
             # TODO : should we really track the likelihood on the background model?
-            if self.background_model is not None and not isinstance(
-                self.background_model, SubtractedBackground
-            ):
+            has_stochastic_bg = any(
+                bg.is_stochastic for bg in self.forward_model.background.values()
+            )
+            if has_stochastic_bg:
                 log_likelihood["observed_background.all"] = concatenate(
                     [
                         ll
@@ -118,9 +129,9 @@ class BayesianModelFitter(BayesianModel, ABC):
 
         predictive_parameters = []
 
-        for key, value in self.forward_model.observations.items():
+        for key in self.forward_model.observations:
             predictive_parameters.append(f"observed.{key}")
-            if self.background_model is not None:
+            if self.forward_model.background.get(key) is not None:
                 predictive_parameters.append(f"observed_background.{key}")
 
         inference_data.posterior_predictive = inference_data.posterior_predictive[
