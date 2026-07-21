@@ -69,19 +69,21 @@ class ConstantShift(ShiftModel):
 class InstrumentModel(nnx.Module):
     """Per-observation instrument response.
 
-    Pass as a dict to :class:`~jaxspec.fit.BayesianModel`::
+    Pass as a dict to [`BayesianModel`][jaxspec.fit.BayesianModel]
 
-        BayesianModel(
-            spectral_model, prior, observations,
-            instrument_model={
-                "PN": None, # explicit reference
-                "MOS1": InstrumentModel(gain=ConstantGain(), shift=ConstantShift()),
-                "MOS2": InstrumentModel(gain=ConstantGain(), shift=ConstantShift()),
-            },
-        )
+    ```python
+    BayesianModel(
+        spectral_model, prior, observations,
+        instrument_model={
+            "PN": None, # explicit reference
+            "MOS1": InstrumentModel(gain=ConstantGain(), shift=ConstantShift()),
+            "MOS2": InstrumentModel(gain=ConstantGain(), shift=ConstantShift()),
+        },
+    )
+    ```
 
     ``None`` entries (or simply omitting an observation) apply the identity
-    fold (``transfer_matrix @ flux``) — useful for the reference instrument.
+    fold (``transfer_matrix @ flux``), this allows to specify the reference instruments.
 
     Parameters:
         gain: Optional :class:`GainModel` (e.g. :class:`ConstantGain`). When
@@ -151,33 +153,77 @@ class InstrumentModel(nnx.Module):
 
 
 class PileupModel(InstrumentModel):
-    """Per-observation instrument response with pileup effects included. Pileup formula from Davis 2001.
+    """Per-observation instrument response including CCD photon **pile-up**.
 
-    Pass as a dict to :class:`~jaxspec.fit.BayesianModel`::
+    The `jaxspec` counterpart of `XSPEC`
+    [`pileup`](https://heasarc.gsfc.nasa.gov/docs/software/xspec/manual/XSmodelPileup.html)
+    convolution model ([Davis 2001](https://iopscience.iop.org/article/10.1086/323488/pdf)) which
+    describes the mixing of photons that reach the same detector region within a
+    single CCD frame, the dominant calibration effect for bright point sources on
+    instruments such as Chandra/ACIS. [`PileupModel`][jaxspec.model.instrument.PileupModel] extends
+    [`InstrumentModel`][jaxspec.model.instrument.InstrumentModel]: pile-up is
+    applied to the effective-area–weighted (ARF) spectrum, *before* the
+    redistribution matrix (RMF) and grouping, matching the ordering of the XSPEC
+    `pileup` model.
 
-        BayesianModel(
-            spectral_model, prior, observations,
-            instrument_model={
-                "Chandra": PileupModel(gain=ConstantGain(), shift=ConstantShift(), **pileup_kwargs),
-            },
-        )
+    !!! warning
+        [`PileupModel`][jaxspec.model.instrument.PileupModel] requires an explicit and linear evaluation
+        grid (pass ``energy_grid=jnp.linspace(low, high, n_bins)`` to the fitter /
+        [`BayesianModel`][jaxspec.fit.BayesianModel]).
+
+    Pass it per observation just like a plain
+    [`InstrumentModel`][jaxspec.model.instrument.InstrumentModel]:
+
+    ```python
+    from jaxspec.fit import MCMCFitter
+    from jaxspec.model.instrument import ConstantGain, ConstantShift, PileupModel
+
+    fitter = MCMCFitter(
+        spectral_model,
+        prior,
+        observations,
+        energy_grid=np.linspace(0.2, 11.0, 1_000),
+        instrument_model={
+            "ACIS": PileupModel(
+                gain=ConstantGain(),
+                shift=ConstantShift(),
+                frame_time=3.2,  # CCD frame time / ACIS EXPTIME (s)
+                frac_expo=1.0,  # ARF FRACEXPO keyword
+            ),
+        },
+    )
+    ```
+
+    `alpha` and `psf_frac` are **fitted** parameters (`nnx.Param` leaves) whose
+    priors are supplied through the unified prior dict like any other instrument
+    parameter, e.g. ``"instrument.alpha"`` and ``"instrument.psf_frac"`` (see
+    [`MCMCFitter`][jaxspec.fit.MCMCFitter]). The remaining arguments are **fixed**
+    configuration constants.
+
+    !!! note
+        Pile-up is **non-linear** in flux: as noted in the
+        [XSPEC `pileup` documentation](https://heasarc.gsfc.nasa.gov/docs/software/xspec/manual/XSmodelPileup.html),
+        increasing the source normalisation does not scale the predicted count
+        rate linearly, and fluxes should be computed with the pile-up correction
+        removed. The extraction region should be large enough to contain
+        essentially all of the point-source PSF.
 
     Parameters:
-        gain and shift: Identical to the InstrumentModel()
-
-        alpha: Grade migration factor : probability that the piled event is not rejected as "bad event"
-
-        psf_frac: Fraction of events in the source extraction region to which pileup will be applied
-
-        frame_time: frame time (of readout time) of the observation. In Chandra data it corresponds to the 'EXPTIME' keyword in the *_evt2.fits file
-
-        frac_expo: good exposure time per frame. Between 0.0 and 1.0. In Chandra data it corresponds to the 'FRACEXPO' keyword
-
-        g0: Optional. Grade correction for single photon detection, between 0.0 and 1.0. Default is 1.0
-
-        npiled: Optional. Number of photons considered for pileup in a single frame. Default is 5
-
-        num_regions: Optional. Number of regions to which pileup model will be applied independently. Default is 1.0, valid for point sources. Extended sources might require higher value.
+        gain: Optional energy-independent flux scaling, as for
+            [`InstrumentModel`][jaxspec.model.instrument.InstrumentModel] (e.g.
+            [`ConstantGain`][jaxspec.model.instrument.ConstantGain]).
+        shift: Optional energy shift, as for
+            [`InstrumentModel`][jaxspec.model.instrument.InstrumentModel] (e.g.
+            [`ConstantShift`][jaxspec.model.instrument.ConstantShift]).
+        alpha: Grade-morphing parameter : the fraction of piled events that keep a good grade,
+            with the good-grade fraction of an order-``p`` pile-up taken
+            proportional to ``alpha ** (p - 1)``.
+        psf_frac: PSF fraction: only this fraction of the extracted counts is treated for pile-up.
+        frame_time: CCD frame (readout) time in seconds (``EXPTIME`` keyword).
+        frac_expo: Fractional exposure per frame in ``(0, 1]`` (``FRACEXPO`` keyword).
+        g0: Grade correction for single-photon detection.
+        npiled: Maximum number of photons piled up in a single frame
+        num_regions: Number of regions over which the piled counts are distributed, `1` for a point source.
     """
 
     requires_components = True
@@ -234,6 +280,9 @@ class PileupModel(InstrumentModel):
         # (the energy grid is assumed uniform, so the first bin width sets the offset).
         bin_width = in_energies[0, 1] - in_energies[0, 0]
         ioff = -jnp.array(in_energies[0, 0] // bin_width, jnp.int32)
+        # Vectorised offset gather (see below): built once and shared across branches.
+        n_orig = in_energies.shape[1]
+        shift_idx = jnp.arange(n_orig) + ioff
 
         def pileup_fold(s):
             # The pileup math operates on a single spectrum; ``jax.tree.map``
@@ -255,12 +304,14 @@ class PileupModel(InstrumentModel):
             # Normalize to avoid overflow and perform FFT convolutions
             arf_s_tmp = arf_s_tmp / integ_arf_s
             integ_arf_s_n = integ_arf_s  # for renormalization after
-            n_orig = arf_s_tmp.shape[-1]
             arf_s_fft = jnp.fft.rfft(arf_s_tmp)
             factor = 1
 
-            # Compute FFT with offset
-            tmpar = jnp.array([arf_s_tmp[ie + ioff] for ie in range(n_orig)])
+            # Compute FFT with offset. ``arf_s_tmp[shift_idx]`` is the vectorised
+            # equivalent of ``[arf_s_tmp[ie + ioff] for ie in range(n_orig)]`` --
+            # a single gather instead of one op per channel (bit-identical, but a
+            # far smaller XLA graph and much faster to trace/compile).
+            tmpar = arf_s_tmp[shift_idx]
             arf_s_fft_2 = jnp.fft.rfft(tmpar)
 
             # Calculate higher order terms
