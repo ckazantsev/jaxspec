@@ -240,7 +240,7 @@ class PileupModel(InstrumentModel):
         factor = 1
 
         # Offset required in case the energy grid does not start at zero
-        ioff = -int(cache["in_energies"][0,0] // (cache["in_energies"][0,1] - cache["in_energies"][0,0])) 
+        ioff = - jnp.array(cache["in_energies"][0,0] // (cache["in_energies"][0,1] - cache["in_energies"][0,0]), jnp.int64)
         
         # Compute FFT with offset
         tmpar = jnp.array([arf_s_tmp[ie + ioff] for ie in range(n_orig)])
