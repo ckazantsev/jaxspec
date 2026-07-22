@@ -267,10 +267,6 @@ class PileupModel(InstrumentModel):
         if eval_energies is None:
             raise ValueError("Eval energies cannot be None : an energy grid must be provided")
 
-        diffs = np.diff(eval_energies, axis=0)
-        if not np.allclose(diffs, diffs.mean()):
-            raise ValueError("eval_energies must be linearly spaced")
-
         eval_energies = self.apply_shift(eval_energies)
         spectrum = jax.tree.map(
             lambda s: redistribute(s, *eval_energies, *cache["in_energies"]), spectrum
