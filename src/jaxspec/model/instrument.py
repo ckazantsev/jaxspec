@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from flax import nnx
 from jax.typing import ArrayLike
@@ -194,8 +195,8 @@ class PileupModel(InstrumentModel):
     )
     ```
 
-    `alpha` and `psf_frac` are **fitted** parameters (`nnx.Param` leaves) whose
-    priors are supplied through the unified prior dict like any other instrument
+    `alpha` and `psf_frac` are **fitted** parameters whose
+    priors are supplied through the prior dictionary like any other instrument
     parameter, e.g. ``"instrument.alpha"`` and ``"instrument.psf_frac"`` (see
     [`MCMCFitter`][jaxspec.fit.MCMCFitter]). The remaining arguments are **fixed**
     configuration constants.
@@ -228,15 +229,22 @@ class PileupModel(InstrumentModel):
 
     requires_components = True
 
-    def __init__(self, gain: GainModel | None = None, shift: ShiftModel | None = None, **kwargs):
+    def __init__(
+        self,
+        gain: GainModel | None = None,
+        shift: ShiftModel | None = None,
+        frac_expo: float | None = None,
+        frame_time: float | None = None,
+        num_regions: float | None = 1.0,
+        g0: float | None = 1.0,
+        npiled: int | None = 5,
+    ):
         super().__init__(gain=gain, shift=shift)
 
-        frac_expo = kwargs.get("frac_expo")
-        frame_time = kwargs.get("frame_time")
         if frac_expo is None or frame_time is None:
             raise ValueError(
                 "PileupModel requires both `frac_expo` and `frame_time` keyword arguments "
-                "(the Chandra 'FRACEXPO' and 'EXPTIME' header values)."
+                "(the 'FRACEXPO' and 'EXPTIME' header values)."
             )
 
         self.alpha = nnx.Param(jnp.asarray(0.5))
@@ -245,9 +253,9 @@ class PileupModel(InstrumentModel):
         self._constants = {
             "frac_expo": frac_expo,
             "frame_time": frame_time,
-            "num_regions": kwargs.get("num_regions", 1.0),
-            "g0": kwargs.get("g0", 1.0),
-            "npiled": int(kwargs.get("npiled", 5)),
+            "num_regions": num_regions,
+            "g0": g0,
+            "npiled": int(np.rint(npiled)),
         }
 
     def fold(
@@ -259,16 +267,15 @@ class PileupModel(InstrumentModel):
         if eval_energies is None:
             raise ValueError("Eval energies cannot be None : an energy grid must be provided")
 
-        # ARF convolution
-        # cache["redistribution"] = to_jax_matrix(obs.redistribution.data, sparse=sparse)
-        # cache["grouping"] = to_jax_matrix(obs.grouping.data, sparse=sparse)
-        # cache["area"] = jnp.asarray(obs.area.data)
-        # cache["exposure"] = jnp.asarray(obs.exposure.data)
+        diffs = np.diff(eval_energies, axis=0)
+        if not np.allclose(diffs, diffs.mean()):
+            raise ValueError("eval_energies must be linearly spaced")
 
         eval_energies = self.apply_shift(eval_energies)
         spectrum = jax.tree.map(
             lambda s: redistribute(s, *eval_energies, *cache["in_energies"]), spectrum
         )
+
         num_regions = self._constants["num_regions"]
         fracexpo = self._constants["frac_expo"]
         frame_time = self._constants["frame_time"]
@@ -279,8 +286,7 @@ class PileupModel(InstrumentModel):
         # Offset required in case the energy grid does not start at zero
         # (the energy grid is assumed uniform, so the first bin width sets the offset).
         bin_width = in_energies[0, 1] - in_energies[0, 0]
-        ioff = -jnp.array(in_energies[0, 0] // bin_width, jnp.int32)
-        # Vectorised offset gather (see below): built once and shared across branches.
+        ioff = -jnp.array(in_energies[0, 0] // bin_width, jnp.int_)
         n_orig = in_energies.shape[1]
         shift_idx = jnp.arange(n_orig) + ioff
 
@@ -307,10 +313,7 @@ class PileupModel(InstrumentModel):
             arf_s_fft = jnp.fft.rfft(arf_s_tmp)
             factor = 1
 
-            # Compute FFT with offset. ``arf_s_tmp[shift_idx]`` is the vectorised
-            # equivalent of ``[arf_s_tmp[ie + ioff] for ie in range(n_orig)]`` --
-            # a single gather instead of one op per channel (bit-identical, but a
-            # far smaller XLA graph and much faster to trace/compile).
+            # Compute FFT with offset
             tmpar = arf_s_tmp[shift_idx]
             arf_s_fft_2 = jnp.fft.rfft(tmpar)
 
